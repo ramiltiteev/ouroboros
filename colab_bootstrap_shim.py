@@ -35,8 +35,16 @@ def export_secret_to_env(name: str, required: bool = False) -> Optional[str]:
 
 
 # Export required runtime secrets so subprocess launcher can always read env fallback.
-for _name in ("OPENROUTER_API_KEY", "TELEGRAM_BOT_TOKEN", "TOTAL_BUDGET", "GITHUB_TOKEN"):
+export_secret_to_env("CLOUDRU_API_KEY", required=False)
+if not os.environ.get("CLOUDRU_API_KEY", "").strip():
+    legacy_or_key = export_secret_to_env("OPENROUTER_API_KEY", required=False)
+    if legacy_or_key and str(legacy_or_key).strip():
+        os.environ["CLOUDRU_API_KEY"] = str(legacy_or_key)
+
+for _name in ("TELEGRAM_BOT_TOKEN", "TOTAL_BUDGET", "GITHUB_TOKEN"):
     export_secret_to_env(_name, required=True)
+
+assert os.environ.get("CLOUDRU_API_KEY", "").strip(), "Missing required secret: CLOUDRU_API_KEY"
 
 # Optional secrets (keep empty if missing).
 for _name in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY"):

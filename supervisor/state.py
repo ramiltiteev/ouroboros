@@ -13,7 +13,7 @@ import os
 import pathlib
 import time
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 log = logging.getLogger(__name__)
 
@@ -261,12 +261,22 @@ def budget_remaining(st: Dict[str, Any]) -> float:
     return max(0.0, total - spent)
 
 
+def _uses_openrouter_backend() -> bool:
+    base_url = os.environ.get("OUROBOROS_LLM_BASE_URL", "").strip()
+    if base_url:
+        return "openrouter.ai" in base_url
+    return bool(os.environ.get("OPENROUTER_API_KEY", "").strip())
+
+
 def check_openrouter_ground_truth() -> Optional[Dict[str, float]]:
     """
     Call OpenRouter API to get ground truth usage.
 
     Returns dict with total_usd and daily_usd spent according to OpenRouter, or None on error.
     """
+    if not _uses_openrouter_backend():
+        return None
+
     try:
         import urllib.request
         api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
@@ -305,7 +315,7 @@ def update_budget_from_usage(usage: Dict[str, Any]) -> None:
     Uses a single lock scope for the read-modify-write cycle to prevent
     concurrent writes from losing budget updates.
 
-    Every 50 calls, fetches OpenRouter ground truth for comparison.
+    Every 50 calls, fetches billing ground truth for comparison when available.
     """
     def _to_float(v: Any, default: float = 0.0) -> float:
         try:
@@ -342,7 +352,7 @@ def update_budget_from_usage(usage: Dict[str, Any]) -> None:
     finally:
         release_file_lock(STATE_LOCK_PATH, lock_fd)
 
-    # Step 2: HTTP to OpenRouter OUTSIDE the lock (can take up to 10s)
+    # Step 2: HTTP to billing backend OUTSIDE the lock (can take up to 10s)
     if should_check_ground_truth:
         ground_truth = check_openrouter_ground_truth()
         if ground_truth is not None:
@@ -622,7 +632,7 @@ def status_text(workers_dict: Dict[int, Any], pending_list: list, running_dict: 
             drift_icon = " ⚠️" if st.get("budget_drift_alert") else ""
             lines.append(
                 f"budget_drift: {drift_pct:.1f}%{drift_icon} "
-                f"(tracked: ${our_delta:.2f} vs OpenRouter: ${or_delta:.2f})"
+                f"(tracked: ${our_delta:.2f} vs billing backend: ${or_delta:.2f})"
             )
 
     # Model breakdown
