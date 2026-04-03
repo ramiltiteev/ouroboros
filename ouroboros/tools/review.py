@@ -8,7 +8,7 @@ import os
 import json
 import asyncio
 import logging
-import httpx
+import requests
 
 from ouroboros.utils import utc_now_iso
 from ouroboros.tools.registry import ToolEntry, ToolContext
@@ -21,7 +21,49 @@ MAX_MODELS = 10
 # Concurrency limit for parallel requests
 CONCURRENCY_LIMIT = 5
 
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+DEFAULT_LLM_BASE_URL = "https://foundation-models.api.cloud.ru/v1"
+
+
+def _llm_base_url() -> str:
+    return os.environ.get("OUROBOROS_LLM_BASE_URL", DEFAULT_LLM_BASE_URL).rstrip("/")
+
+
+def _llm_api_key() -> str:
+    return (
+        os.environ.get("OUROBOROS_LLM_API_KEY", "")
+        or os.environ.get("CLOUDRU_API_KEY", "")
+        or os.environ.get("OPENROUTER_API_KEY", "")
+    )
+
+
+def _chat_completions_url() -> str:
+    return f"{_llm_base_url()}/chat/completions"
+
+
+def _is_openrouter_backend() -> bool:
+    return "openrouter.ai" in _llm_base_url()
+
+
+def _post_model(url: str, api_key: str, messages: list, model: str, is_openrouter: bool):
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    if is_openrouter:
+        headers.update({
+            "HTTP-Referer": "https://colab.research.google.com/",
+            "X-Title": "Ouroboros",
+        })
+    return requests.post(
+        url,
+        headers=headers,
+        json={
+            "model": model,
+            "messages": messages,
+            "temperature": 0.2,
+        },
+        timeout=120.0,
+    )
 
 
 def get_tools():
@@ -54,7 +96,7 @@ def get_tools():
                             "type": "array",
                             "items": {"type": "string"},
                             "description": (
-                                "OpenRouter model identifiers to query "
+                                "Model identifiers to query "
                                 "(e.g. 3 diverse models for good coverage)"
                             ),
                         },
@@ -91,18 +133,13 @@ async def _query_model(client, model, messages, api_key, semaphore):
     """Query a single model with semaphore-based concurrency control. Returns (model, response_dict, headers_dict) or (model, error_str, None)."""
     async with semaphore:
         try:
-            resp = await client.post(
-                OPENROUTER_URL,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": model,
-                    "messages": messages,
-                    "temperature": 0.2,
-                },
-                timeout=120.0,
+            resp = await asyncio.to_thread(
+                _post_model,
+                _chat_completions_url(),
+                api_key,
+                messages,
+                model,
+                _is_openrouter_backend(),
             )
 
             # Extract ALL data while client is still open
@@ -146,9 +183,9 @@ async def _multi_model_review_async(content: str, prompt: str, models: list, ctx
     if len(models) == 0:
         return {"error": "At least one model is required"}
 
-    api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    api_key = _llm_api_key()
     if not api_key:
-        return {"error": "OPENROUTER_API_KEY not set"}
+        return {"error": "LLM API key not set (set OUROBOROS_LLM_API_KEY or CLOUDRU_API_KEY)"}
 
     messages = [
         {"role": "system", "content": prompt},
@@ -157,9 +194,8 @@ async def _multi_model_review_async(content: str, prompt: str, models: list, ctx
 
     # Query all models with bounded concurrency
     semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
-    async with httpx.AsyncClient() as client:
-        tasks = [_query_model(client, m, messages, api_key, semaphore) for m in models]
-        results = await asyncio.gather(*tasks)
+    tasks = [_query_model(None, m, messages, api_key, semaphore) for m in models]
+    results = await asyncio.gather(*tasks)
 
     # Parse and process results
     review_results = []
@@ -231,7 +267,7 @@ def _parse_model_response(model: str, result, headers_dict) -> dict:
         elif headers_dict:
             # Case-insensitive search for cost header
             for key, value in headers_dict.items():
-                if key.lower() == "x-openrouter-cost":
+                if key.lower() in {"x-openrouter-cost", "x-cost", "x-usage-cost"}:
                     cost = float(value)
                     break
     except (ValueError, TypeError, KeyError):

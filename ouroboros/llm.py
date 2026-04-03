@@ -1,7 +1,7 @@
 """
 Ouroboros — LLM client.
 
-The only module that communicates with the LLM API (OpenRouter).
+The only module that communicates with the LLM API.
 Contract: chat(), default_model(), available_models(), add_usage().
 """
 
@@ -103,28 +103,42 @@ def fetch_openrouter_pricing() -> Dict[str, Tuple[float, float, float]]:
 
 
 class LLMClient:
-    """OpenRouter API wrapper. All LLM calls go through this class."""
+    """LLM API wrapper. All LLM calls go through this class."""
 
     def __init__(
         self,
         api_key: Optional[str] = None,
-        base_url: str = "https://openrouter.ai/api/v1",
+        base_url: Optional[str] = None,
     ):
-        self._api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
-        self._base_url = base_url
+        self._api_key = (
+            api_key
+            or os.environ.get("OUROBOROS_LLM_API_KEY", "")
+            or os.environ.get("CLOUDRU_API_KEY", "")
+            or os.environ.get("OPENROUTER_API_KEY", "")
+        )
+        self._base_url = (
+            base_url
+            or os.environ.get("OUROBOROS_LLM_BASE_URL", "")
+            or "https://foundation-models.api.cloud.ru/v1"
+        )
         self._client = None
+
+    def _is_openrouter_backend(self) -> bool:
+        return "openrouter.ai" in self._base_url
 
     def _get_client(self):
         if self._client is None:
             from openai import OpenAI
-            self._client = OpenAI(
-                base_url=self._base_url,
-                api_key=self._api_key,
-                default_headers={
+            kwargs: Dict[str, Any] = {
+                "base_url": self._base_url,
+                "api_key": self._api_key,
+            }
+            if self._is_openrouter_backend():
+                kwargs["default_headers"] = {
                     "HTTP-Referer": "https://colab.research.google.com/",
                     "X-Title": "Ouroboros",
-                },
-            )
+                }
+            self._client = OpenAI(**kwargs)
         return self._client
 
     def _fetch_generation_cost(self, generation_id: str) -> Optional[float]:
@@ -164,30 +178,32 @@ class LLMClient:
         client = self._get_client()
         effort = normalize_reasoning_effort(reasoning_effort)
 
-        extra_body: Dict[str, Any] = {
-            "reasoning": {"effort": effort, "exclude": True},
-        }
-
-        # Pin Anthropic models to Anthropic provider for prompt caching
-        if model.startswith("anthropic/"):
-            extra_body["provider"] = {
-                "order": ["Anthropic"],
-                "allow_fallbacks": False,
-                "require_parameters": True,
-            }
-
         kwargs: Dict[str, Any] = {
             "model": model,
             "messages": messages,
             "max_tokens": max_tokens,
-            "extra_body": extra_body,
         }
+
+        if self._is_openrouter_backend():
+            extra_body: Dict[str, Any] = {
+                "reasoning": {"effort": effort, "exclude": True},
+            }
+
+            # Pin Anthropic models to Anthropic provider for prompt caching
+            if model.startswith("anthropic/"):
+                extra_body["provider"] = {
+                    "order": ["Anthropic"],
+                    "allow_fallbacks": False,
+                    "require_parameters": True,
+                }
+            kwargs["extra_body"] = extra_body
+
         if tools:
-            # Add cache_control to last tool for Anthropic prompt caching
-            # This caches all tool schemas (they never change between calls)
-            tools_with_cache = [t for t in tools]  # shallow copy
-            if tools_with_cache:
-                last_tool = {**tools_with_cache[-1]}  # copy last tool
+            tools_with_cache = [t for t in tools]
+            if self._is_openrouter_backend() and tools_with_cache:
+                # Add cache_control to last tool for Anthropic prompt caching.
+                # This caches all tool schemas (they never change between calls).
+                last_tool = {**tools_with_cache[-1]}
                 last_tool["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
                 tools_with_cache[-1] = last_tool
             kwargs["tools"] = tools_with_cache
@@ -217,8 +233,8 @@ class LLMClient:
                 if cache_write:
                     usage["cache_write_tokens"] = int(cache_write)
 
-        # Ensure cost is present in usage (OpenRouter includes it, but fallback if missing)
-        if not usage.get("cost"):
+        # Ensure cost is present in usage for OpenRouter (fallback via Generation API).
+        if self._is_openrouter_backend() and not usage.get("cost"):
             gen_id = resp_dict.get("id") or ""
             if gen_id:
                 cost = self._fetch_generation_cost(gen_id)
